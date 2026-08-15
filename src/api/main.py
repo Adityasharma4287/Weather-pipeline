@@ -68,6 +68,13 @@ if os.path.isdir(_STATIC_DIR):
         end user can get a forecast without touching the CLI or curl."""
         return FileResponse(os.path.join(_STATIC_DIR, "index.html"))
 
+    @app.get("/favicon.ico", include_in_schema=False, tags=["ui"])
+    def favicon():
+        """Browsers request /favicon.ico by default regardless of the
+        <link rel="icon"> tag; serving it here avoids harmless-but-noisy
+        404s in the deployment logs."""
+        return FileResponse(os.path.join(_STATIC_DIR, "favicon.png"))
+
 # Response cache keyed by (region, variable, lead_hours) — avoids re-running
 # the pipeline for repeated identical requests, per architecture doc Sec. 3-E.
 _response_cache: Dict[Tuple[str, str, int], ForecastResponse] = {}

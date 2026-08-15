@@ -21,8 +21,12 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Dict, Tuple
 
+import os
+
 import numpy as np
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 from src.api.auth import extract_bearer_token, get_auth_service, get_rate_limiter
 from src.api.schemas import (
@@ -45,6 +49,16 @@ app = FastAPI(
 
 _orchestrator = WeatherPipelineOrchestrator()
 _audit = AuditLog()
+
+_STATIC_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "static")
+if os.path.isdir(_STATIC_DIR):
+    app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
+
+    @app.get("/", include_in_schema=False, tags=["ui"])
+    def browser_ui():
+        """Serves the lightweight browser demo UI at the site root, so an
+        end user can get a forecast without touching the CLI or curl."""
+        return FileResponse(os.path.join(_STATIC_DIR, "index.html"))
 
 # Response cache keyed by (region, variable, lead_hours) — avoids re-running
 # the pipeline for repeated identical requests, per architecture doc Sec. 3-E.

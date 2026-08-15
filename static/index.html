@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Localized Weather Intelligence — Demo</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; background:#0b1020; color:#e6e9f2; margin:0; padding:2rem; }
+  h1 { font-size: 1.3rem; font-weight: 600; margin-bottom: 0.25rem; }
+  .sub { color:#8b93b0; margin-bottom: 1.5rem; font-size: 0.9rem; }
+  .panel { background:#131a2e; border:1px solid #232c4a; border-radius:12px; padding:1.25rem; max-width: 720px; }
+  label { display:block; font-size:0.8rem; color:#9aa3c2; margin-top: 0.75rem; }
+  input, select { width:100%; box-sizing:border-box; margin-top:0.25rem; padding:0.5rem; border-radius:8px; border:1px solid #2a3356; background:#0e1428; color:#e6e9f2; }
+  button { margin-top:1.25rem; padding:0.6rem 1.1rem; border-radius:8px; border:none; background:#4f7cff; color:white; font-weight:600; cursor:pointer; }
+  button:disabled { opacity:0.5; cursor:default; }
+  #status { margin-top:1rem; font-size:0.85rem; color:#9aa3c2; white-space:pre-wrap; }
+  #result { margin-top:1.5rem; }
+  canvas { border-radius:8px; border:1px solid #232c4a; image-rendering: pixelated; }
+  .metrics { display:flex; gap:1.5rem; margin-top:0.75rem; flex-wrap:wrap; }
+  .metric { background:#0e1428; border:1px solid #232c4a; border-radius:8px; padding:0.6rem 0.9rem; }
+  .metric .val { font-size:1.1rem; font-weight:700; }
+  .metric .lbl { font-size:0.7rem; color:#9aa3c2; }
+  .badge { display:inline-block; padding:0.15rem 0.5rem; border-radius:999px; font-size:0.7rem; font-weight:700; }
+  .badge.ok { background:#123a26; color:#4ade80; }
+  .badge.bad { background:#3a1212; color:#f87171; }
+</style>
+</head>
+<body>
+  <h1>Localized Weather Intelligence Pipeline</h1>
+  <div class="sub">Live demo — every request runs the real Stage A→D pipeline on the server.</div>
+
+  <div class="panel">
+    <label>Region ID</label>
+    <input id="region" value="demo-metro" />
+
+    <label>Variable</label>
+    <select id="variable">
+      <option value="t2m">t2m — 2m temperature (K)</option>
+      <option value="tp">tp — precipitation (mm/hr)</option>
+      <option value="u10">u10 — 10m u-wind (m/s)</option>
+      <option value="v10">v10 — 10m v-wind (m/s)</option>
+    </select>
+
+    <label>Lead time (hours)</label>
+    <input id="leadHours" type="number" value="24" min="6" max="240" />
+
+    <button id="runBtn" onclick="runForecast()">Get forecast</button>
+    <div id="status"></div>
+
+    <div id="result" style="display:none;">
+      <div class="metrics">
+        <div class="metric"><div class="val" id="mRmse">-</div><div class="lbl">RMSE</div></div>
+        <div class="metric"><div class="val" id="mCrps">-</div><div class="lbl">CRPS</div></div>
+        <div class="metric"><div class="val" id="mSpread">-</div><div class="lbl">Spread/Skill</div></div>
+        <div class="metric"><div class="val" id="mSig">-</div><div class="lbl">Signature</div></div>
+      </div>
+      <div style="margin-top:1rem;">
+        <canvas id="heatmap" width="256" height="256"></canvas>
+      </div>
+    </div>
+  </div>
+
+<script>
+let token = null;
+
+async function ensureToken() {
+  if (token) return token;
+  const resp = await fetch('/v1/auth/token', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({sub: 'browser-demo-user', tenant: 'demo', scopes: ['forecast:read']})
+  });
+  if (!resp.ok) throw new Error('Token issuance failed: ' + resp.status);
+  const data = await resp.json();
+  token = data.access_token;
+  return token;
+}
+
+function drawHeatmap(field) {
+  const canvas = document.getElementById('heatmap');
+  const ctx = canvas.getContext('2d');
+  const h = field.length, w = field[0].length;
+  canvas.width = w; canvas.height = h;
+
+  let lo = Infinity, hi = -Infinity;
+  for (const row of field) for (const v of row) { if (v < lo) lo = v; if (v > hi) hi = v; }
+  const span = (hi - lo) || 1;
+
+  const img = ctx.createImageData(w, h);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const t = (field[y][x] - lo) / span; // 0..1
+      // simple blue -> yellow -> red colormap
+      const r = Math.round(255 * Math.min(1, t * 2));
+      const g = Math.round(255 * (1 - Math.abs(t - 0.5) * 2));
+      const b = Math.round(255 * Math.min(1, (1 - t) * 2));
+      const idx = (y * w + x) * 4;
+      img.data[idx] = r; img.data[idx+1] = g; img.data[idx+2] = b; img.data[idx+3] = 255;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+
+  // Upscale the canvas visually via CSS while keeping crisp pixels.
+  canvas.style.width = '384px';
+  canvas.style.height = '384px';
+}
+
+async function runForecast() {
+  const btn = document.getElementById('runBtn');
+  const status = document.getElementById('status');
+  const region = document.getElementById('region').value.trim();
+  const variable = document.getElementById('variable').value;
+  const leadHours = document.getElementById('leadHours').value;
+
+  if (!region) { status.textContent = 'Region ID is required.'; return; }
+
+  btn.disabled = true;
+  status.textContent = 'Authenticating...';
+  try {
+    const tok = await ensureToken();
+    status.textContent = 'Running pipeline (Stage A -> D)...';
+
+    const url = `/v1/forecast/${encodeURIComponent(region)}?variable=${variable}&lead_hours=${leadHours}`;
+    const resp = await fetch(url, { headers: { 'Authorization': `Bearer ${tok}` } });
+
+    if (resp.status === 401) { token = null; throw new Error('Token expired/invalid — try again.'); }
+    if (!resp.ok) { const t = await resp.text(); throw new Error(`Request failed (${resp.status}): ${t}`); }
+
+    const data = await resp.json();
+    document.getElementById('mRmse').textContent = data.verification ? data.verification.rmse.toFixed(3) : '-';
+    document.getElementById('mCrps').textContent = data.verification ? data.verification.crps.toFixed(3) : '-';
+    document.getElementById('mSpread').textContent = data.verification ? data.verification.spread_skill_ratio.toFixed(3) : '-';
+    document.getElementById('mSig').innerHTML = data.signature_verified
+      ? '<span class="badge ok">verified</span>' : '<span class="badge bad">FAILED</span>';
+
+    drawHeatmap(data.ensemble_summary.mean);
+    document.getElementById('result').style.display = 'block';
+    status.textContent = `Model: ${data.model_version} | ${data.region_id} | ${variable} @ ${leadHours}h`;
+  } catch (err) {
+    status.textContent = 'Error: ' + err.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+</script>
+</body>
+</html>

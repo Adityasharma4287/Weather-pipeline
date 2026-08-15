@@ -92,6 +92,7 @@ class SecretsManager:
                 "JWT_SIGNING_SECRET", "dev-jwt-secret-do-not-use-in-prod"
             ),
             "routing/google-maps-api-key": os.environ.get("GOOGLE_MAPS_API_KEY", ""),
+            "routing/maptiler-api-key": os.environ.get("MAPTILER_API_KEY", ""),
         }
         with self._lock:
             self._store.update(defaults)

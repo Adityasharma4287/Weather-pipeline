@@ -108,6 +108,14 @@ def test_maps_config_endpoint_reports_unconfigured_by_default(client):
     assert body["configured"] is False
 
 
+def test_maptiler_config_endpoint_reports_unconfigured_by_default(client):
+    resp = client.get("/v1/config/maptiler-key")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["configured"] is False
+    assert body["api_key"] == ""
+
+
 def test_route_weather_requires_auth(client):
     resp = client.get("/v1/route-weather", params={"origin": "A", "destination": "B"})
     assert resp.status_code == 401

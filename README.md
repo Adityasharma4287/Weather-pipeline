@@ -158,33 +158,48 @@ curl http://127.0.0.1:8000/v1/health
 Unauthenticated requests get `401`; tokens missing the `forecast:read`
 scope get `403`; repeated identical requests are served from cache.
 
-## Map navigation + weather along the route (Google Maps)
+## Map navigation + weather along the route
 
-A new feature: real Google Maps turn-by-turn navigation, with the pipeline's
-weather sampled at points along the route — "map pe route + us route ke
-weather conditions".
+Real route navigation (Google Directions API, called **server-side only**)
+with the pipeline's weather sampled at points along the route, rendered on
+a **MapTiler** map in the browser — "map pe route + us route ke weather
+conditions".
+
+Two separate providers, two separate jobs, so a billing/referrer problem
+with one never blocks the other:
+- **Google Directions API** — real route, distance, duration, turn-by-turn
+  steps. Called only from the backend (`src/routing/google_directions.py`),
+  so it only needs the "Directions API" enabled — not "Maps JavaScript
+  API" (which is what caused browser `InvalidKeyMapError`/billing issues
+  in earlier iterations of this project).
+- **MapTiler** — renders the map itself in the browser
+  (`static/route.html`). No route calculation happens on the MapTiler
+  side; it just draws the line and markers the backend gives it.
 
 **Setup (one-time):**
-1. In [Google Cloud Console](https://console.cloud.google.com/), enable the
-   **Directions API** and **Maps JavaScript API** for your project, and
-   create an API key.
-2. Add it to your `.env`:
+1. **Google:** in [Google Cloud Console](https://console.cloud.google.com/),
+   enable the **Directions API** and create/reuse an API key. No Maps
+   JavaScript API needed anymore, no billing-sensitive browser rendering.
+2. **MapTiler:** get a free key from
+   [cloud.maptiler.com/account/keys](https://cloud.maptiler.com/account/keys/).
+3. Add both to `.env` (or your Vercel/host's environment variables):
    ```
-   GOOGLE_MAPS_API_KEY=your-real-key-here
+   GOOGLE_MAPS_API_KEY=your-real-google-key-here
+   MAPTILER_API_KEY=your-real-maptiler-key-here
    ```
-   (Local dev without Docker: `export GOOGLE_MAPS_API_KEY=your-real-key-here`
-   before running `uvicorn`.)
-3. For production, restrict the key: HTTP-referrer restriction if you use
-   the same key client-side (this app serves it to the browser via
-   `/v1/config/maps-key` for map rendering), and/or use a second,
-   server-IP-restricted key for the backend's own Directions API calls.
+4. For production, restrict each key in its own dashboard: Google's
+   Directions key by server IP (it's never called from a browser now); the
+   MapTiler key by domain, in the MapTiler dashboard.
 
 **Use it:** start the server, open `http://127.0.0.1:8000/static/route.html`
 (also linked from the main `/` demo page). Enter an origin and destination,
 pick a weather variable, click **Get route + weather**. You get:
-- The real Google-rendered route and turn-by-turn directions.
-- Numbered markers along the route, colored by the pipeline's forecast
-  value at that point, with a distance-from-start readout.
+- The real route drawn on the MapTiler map (from Google's routed path,
+  computed server-side).
+- Numbered, colored markers along the route showing the pipeline's
+  forecast value at that point, with a distance-from-start readout —
+  click a marker for the exact value.
+- Turn-by-turn instructions and total distance/duration in the sidebar.
 - Signature-verification status confirming every waypoint's forecast went
   through the same signed-artifact integrity check as the rest of the
   pipeline.
@@ -208,10 +223,12 @@ pick a weather variable, click **Get route + weather**. You get:
 New endpoints:
 - `GET /v1/route-weather?origin=...&destination=...&variable=t2m&num_waypoints=6`
   — auth required (`forecast:read` scope), same pattern as `/v1/forecast`.
-- `GET /v1/config/maps-key` — public, returns the browser-side Maps key so
-  it isn't hardcoded into the static JS (safe because this key is meant to
-  be referrer-restricted, not secret in the same sense as the Directions
-  API credential).
+  Returns the route (`path`, dense polyline for drawing), `steps_summary`,
+  and per-waypoint weather.
+- `GET /v1/config/maptiler-key` — public, returns the browser-side MapTiler
+  key so it isn't hardcoded into the static JS.
+- `GET /v1/config/maps-key` — kept for compatibility with any client that
+  still wants Google's own map tiles; not used by `route.html` anymore.
 
 ## Browser UI (no CLI needed)
 

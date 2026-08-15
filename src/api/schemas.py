@@ -84,3 +84,8 @@ class RouteWeatherResponse(BaseModel):
 class MapsConfigResponse(BaseModel):
     browser_key: str
     configured: bool
+
+
+class MapTilerConfigResponse(BaseModel):
+    api_key: str
+    configured: bool

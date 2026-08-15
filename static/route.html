@@ -3,13 +3,15 @@
 <head>
 <meta charset="UTF-8" />
 <title>Weather-Aware Route Navigation</title>
+<script src="https://cdn.maptiler.com/maptiler-sdk-js/v2.0.0/maptiler-sdk.umd.min.js"></script>
+<link href="https://cdn.maptiler.com/maptiler-sdk-js/v2.0.0/maptiler-sdk.css" rel="stylesheet" />
 <style>
   :root { color-scheme: dark; }
   html, body { height: 100%; margin: 0; font-family: -apple-system, Segoe UI, Roboto, sans-serif; background:#0b1020; color:#e6e9f2; }
   #layout { display:flex; height:100%; }
   #sidebar { width: 360px; flex-shrink:0; padding: 1.25rem; box-sizing:border-box; background:#131a2e; border-right:1px solid #232c4a; overflow-y:auto; }
   #mapWrap { flex:1; position:relative; }
-  #map { width:100%; height:100%; }
+  #map { position:absolute; top:0; bottom:0; left:0; right:0; width:100%; height:100%; }
   h1 { font-size: 1.05rem; font-weight:600; margin: 0 0 0.25rem; }
   .sub { color:#8b93b0; font-size:0.8rem; margin-bottom:1.25rem; }
   label { display:block; font-size:0.78rem; color:#9aa3c2; margin-top:0.75rem; }
@@ -25,6 +27,7 @@
   .steps { margin-top:1rem; font-size:0.75rem; color:#9aa3c2; max-height:150px; overflow-y:auto; }
   .steps div { margin-bottom:0.35rem; }
   a.back { color:#7c9bff; font-size:0.78rem; text-decoration:none; }
+  .maplibregl-popup-content, .maptiler-popup-content { background:#131a2e !important; color:#e6e9f2 !important; }
 </style>
 </head>
 <body>
@@ -32,7 +35,7 @@
   <div id="sidebar">
     <a class="back" href="/">&larr; Forecast demo</a>
     <h1 style="margin-top:0.75rem;">Weather-Aware Route Navigation</h1>
-    <div class="sub">Real Google navigation, weather sampled along the route by the pipeline.</div>
+    <div class="sub">Real route (Google Directions, server-side) + weather sampled along it by the pipeline, rendered on a MapTiler map.</div>
 
     <label>Origin</label>
     <input id="origin" value="Indore, Madhya Pradesh" />
@@ -62,7 +65,11 @@
 </div>
 
 <script>
-let map, directionsRenderer, weatherMarkers = [], token = null;
+let map = null;
+let markers = [];
+let token = null;
+const ROUTE_SOURCE_ID = 'route-path';
+const ROUTE_LAYER_ID = 'route-path-line';
 
 async function ensureToken() {
   if (token) return token;
@@ -75,21 +82,20 @@ async function ensureToken() {
   return (await resp.json()).access_token;
 }
 
-function clearWeatherMarkers() {
-  weatherMarkers.forEach(m => m.setMap(null));
-  weatherMarkers = [];
+function clearMarkers() {
+  markers.forEach(m => m.remove());
+  markers = [];
 }
 
 function colorForValue(value, variable) {
-  // Rough, illustrative color banding per variable — not a calibrated scale.
   if (variable === 'tp') {
     if (value > 15) return '#e14b4b';
     if (value > 5) return '#e1a94b';
     return '#4b8fe1';
   }
   if (variable === 't2m') {
-    if (value > 303) return '#e14b4b';   // ~30C+
-    if (value > 288) return '#e1c74b';   // ~15-30C
+    if (value > 303) return '#e14b4b';
+    if (value > 288) return '#e1c74b';
     return '#4b8fe1';
   }
   return '#7c9bff';
@@ -97,6 +103,60 @@ function colorForValue(value, variable) {
 
 function unitFor(variable) {
   return {t2m: 'K', tp: 'mm/hr', u10: 'm/s', v10: 'm/s'}[variable] || '';
+}
+
+function drawRouteLine(pathLatLon) {
+  // pathLatLon comes from our backend as [[lat, lon], ...]; MapTiler/MapLibre
+  // GeoJSON wants [lon, lat].
+  const coords = pathLatLon.map(([lat, lon]) => [lon, lat]);
+  const geojson = { type: 'Feature', geometry: { type: 'LineString', coordinates: coords }, properties: {} };
+
+  if (map.getSource(ROUTE_SOURCE_ID)) {
+    map.getSource(ROUTE_SOURCE_ID).setData(geojson);
+  } else {
+    map.addSource(ROUTE_SOURCE_ID, { type: 'geojson', data: geojson });
+    map.addLayer({
+      id: ROUTE_LAYER_ID,
+      type: 'line',
+      source: ROUTE_SOURCE_ID,
+      layout: { 'line-join': 'round', 'line-cap': 'round' },
+      paint: { 'line-color': '#4f7cff', 'line-width': 4, 'line-opacity': 0.85 },
+    });
+  }
+
+  const bounds = new maptilersdk.LngLatBounds();
+  coords.forEach(c => bounds.extend(c));
+  map.fitBounds(bounds, { padding: 60, duration: 600 });
+}
+
+function addWeatherMarkers(waypoints, variable) {
+  waypoints.forEach((w, i) => {
+    const el = document.createElement('div');
+    el.style.width = '26px';
+    el.style.height = '26px';
+    el.style.borderRadius = '50%';
+    el.style.background = colorForValue(w.value, variable);
+    el.style.border = '2px solid #0b1020';
+    el.style.display = 'flex';
+    el.style.alignItems = 'center';
+    el.style.justifyContent = 'center';
+    el.style.color = 'white';
+    el.style.fontSize = '11px';
+    el.style.fontWeight = '700';
+    el.style.boxShadow = '0 1px 4px rgba(0,0,0,0.5)';
+    el.textContent = String(i + 1);
+
+    const popup = new maptilersdk.Popup({ offset: 16 }).setHTML(
+      `<div style="font-size:12px;"><b>${w.value.toFixed(1)} ${unitFor(variable)}</b><br/>` +
+      `${w.distance_from_start_km.toFixed(0)} km from start</div>`
+    );
+
+    const marker = new maptilersdk.Marker({ element: el })
+      .setLngLat([w.lon, w.lat])
+      .setPopup(popup)
+      .addTo(map);
+    markers.push(marker);
+  });
 }
 
 async function planRoute() {
@@ -114,26 +174,13 @@ async function planRoute() {
   document.getElementById('summary').style.display = 'none';
   document.getElementById('waypointList').innerHTML = '';
   document.getElementById('stepsBox').innerHTML = '';
-  clearWeatherMarkers();
-  if (directionsRenderer) directionsRenderer.setDirections({routes: []});
+  clearMarkers();
 
   try {
     const tok = await ensureToken();
     token = tok;
 
-    // 1. Real Google navigation, rendered client-side.
-    status.textContent = 'Requesting route from Google Directions...';
-    const directionsService = new google.maps.DirectionsService();
-    const dirResult = await new Promise((resolve, reject) => {
-      directionsService.route(
-        { origin, destination, travelMode: google.maps.TravelMode.DRIVING },
-        (result, statusCode) => statusCode === 'OK' ? resolve(result) : reject(new Error('Directions failed: ' + statusCode))
-      );
-    });
-    directionsRenderer.setDirections(dirResult);
-
-    // 2. Weather along the (server-computed) route from our pipeline.
-    status.textContent = 'Running weather pipeline along the route...';
+    status.textContent = 'Running route + weather pipeline on the server...';
     const url = `/v1/route-weather?origin=${encodeURIComponent(origin)}&destination=${encodeURIComponent(destination)}` +
                 `&variable=${variable}&num_waypoints=${numWaypoints}`;
     const resp = await fetch(url, { headers: { 'Authorization': `Bearer ${tok}` } });
@@ -143,7 +190,9 @@ async function planRoute() {
     }
     const data = await resp.json();
 
-    // Summary panel.
+    drawRouteLine(data.path);
+    addWeatherMarkers(data.waypoints, variable);
+
     const summary = document.getElementById('summary');
     summary.style.display = 'block';
     summary.innerHTML = `
@@ -151,29 +200,6 @@ async function planRoute() {
       <div>Model: ${data.model_version}</div>
     `;
 
-    // Weather markers along the route.
-    const bounds = new google.maps.LatLngBounds();
-    data.waypoints.forEach((w, i) => {
-      const pos = { lat: w.lat, lng: w.lon };
-      bounds.extend(pos);
-      const marker = new google.maps.Marker({
-        position: pos,
-        map,
-        label: { text: String(i + 1), color: 'white', fontSize: '11px', fontWeight: '700' },
-        icon: {
-          path: google.maps.SymbolPath.CIRCLE,
-          fillColor: colorForValue(w.value, variable),
-          fillOpacity: 0.95,
-          strokeColor: '#0b1020',
-          strokeWeight: 2,
-          scale: 12,
-        },
-        title: `${w.value.toFixed(1)} ${unitFor(variable)} at ${w.distance_from_start_km.toFixed(0)} km`,
-      });
-      weatherMarkers.push(marker);
-    });
-
-    // Waypoint list in the sidebar.
     const list = document.getElementById('waypointList');
     data.waypoints.forEach((w, i) => {
       const row = document.createElement('div');
@@ -183,7 +209,6 @@ async function planRoute() {
       list.appendChild(row);
     });
 
-    // Turn-by-turn steps.
     const stepsBox = document.getElementById('stepsBox');
     data.steps_summary.slice(0, 15).forEach(s => {
       const d = document.createElement('div');
@@ -199,37 +224,29 @@ async function planRoute() {
   }
 }
 
-function initMap() {
-  map = new google.maps.Map(document.getElementById('map'), {
-    center: { lat: 22.9734, lng: 78.6569 }, // Madhya Pradesh, India — roughly the demo region
-    zoom: 6,
-    styles: [{ elementType: 'geometry', stylers: [{ color: '#131a2e' }] },
-             { elementType: 'labels.text.stroke', stylers: [{ color: '#0b1020' }] },
-             { elementType: 'labels.text.fill', stylers: [{ color: '#8b93b0' }] }],
-  });
-  directionsRenderer = new google.maps.DirectionsRenderer({ map, suppressMarkers: false });
-}
-
 async function bootstrap() {
   const status = document.getElementById('status');
   try {
-    const resp = await fetch('/v1/config/maps-key');
+    const resp = await fetch('/v1/config/maptiler-key');
     const cfg = await resp.json();
     if (!cfg.configured) {
-      status.textContent = 'GOOGLE_MAPS_API_KEY is not set on the server — set it in .env and restart. See README.';
+      status.textContent = 'MAPTILER_API_KEY is not set on the server — set it in .env / Vercel env vars and restart. See README.';
       document.getElementById('goBtn').disabled = true;
       return;
     }
-    const script = document.createElement('script');
-    script.src = `https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(cfg.browser_key)}&callback=initMap`;
-    script.async = true;
-    document.head.appendChild(script);
+
+    maptilersdk.config.apiKey = cfg.api_key;
+    map = new maptilersdk.Map({
+      container: 'map',
+      style: maptilersdk.MapStyle.STREETS,
+      center: [78.6569, 22.9734], // [lon, lat] — Madhya Pradesh, India, roughly the demo region
+      zoom: 6,
+    });
   } catch (err) {
     status.textContent = 'Failed to load map config: ' + err.message;
   }
 }
 
-window.initMap = initMap;
 bootstrap();
 </script>
 </body>

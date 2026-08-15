@@ -34,6 +34,7 @@ from src.api.schemas import (
     ForecastResponse,
     HealthResponse,
     MapsConfigResponse,
+    MapTilerConfigResponse,
     RouteWaypointResponse,
     RouteWeatherResponse,
     TokenRequest,
@@ -211,6 +212,12 @@ def get_maps_browser_key():
     map without the key being baked into static JS. This key is meant to be
     restricted by HTTP referrer in Google Cloud Console — it is not a
     server secret in the same sense as the Directions API credential.
+
+    Note: as of the MapTiler-based route.html, this key is no longer used
+    for map rendering (see /v1/config/maptiler-key) — it remains available
+    for the server-side Directions API call in route_weather_service.py,
+    and this endpoint is kept for any client that still wants Google's
+    own map tiles.
     """
     try:
         key = get_default_secrets_manager().get_secret(
@@ -219,6 +226,24 @@ def get_maps_browser_key():
     except SecretNotFoundError:
         key = ""
     return MapsConfigResponse(browser_key=key, configured=bool(key))
+
+
+@app.get("/v1/config/maptiler-key", response_model=MapTilerConfigResponse, tags=["routing"])
+def get_maptiler_key():
+    """
+    Returns the browser-side MapTiler API key used to render the map itself
+    in static/route.html. MapTiler keys are meant to be used client-side
+    (restrict them by domain in your MapTiler account dashboard for
+    production) — this is the same trust model as the Google Maps browser
+    key above, just for a different map provider.
+    """
+    try:
+        key = get_default_secrets_manager().get_secret(
+            "secretsmanager://routing/maptiler-api-key", requested_by="maptiler-config-endpoint"
+        )
+    except SecretNotFoundError:
+        key = ""
+    return MapTilerConfigResponse(api_key=key, configured=bool(key))
 
 
 @app.get("/v1/health", response_model=HealthResponse, tags=["ops"])

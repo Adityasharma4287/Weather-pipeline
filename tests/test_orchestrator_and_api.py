@@ -97,3 +97,33 @@ def test_forecast_response_is_cached_on_second_call(client):
 def test_invalid_token_rejected(client):
     resp = client.get("/v1/forecast/test-region", headers={"Authorization": "Bearer not-a-real-token"})
     assert resp.status_code == 401
+
+
+def test_maps_config_endpoint_reports_unconfigured_by_default(client):
+    resp = client.get("/v1/config/maps-key")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "configured" in body
+    # In the test environment no real GOOGLE_MAPS_API_KEY is set.
+    assert body["configured"] is False
+
+
+def test_route_weather_requires_auth(client):
+    resp = client.get("/v1/route-weather", params={"origin": "A", "destination": "B"})
+    assert resp.status_code == 401
+
+
+def test_route_weather_without_configured_key_returns_502(client):
+    """
+    Without a real GOOGLE_MAPS_API_KEY configured, the route-weather
+    endpoint should fail cleanly (502, with a clear message) rather than
+    silently returning fake data or crashing with a 500.
+    """
+    token = _get_token(client)
+    resp = client.get(
+        "/v1/route-weather",
+        params={"origin": "Indore, MP", "destination": "Bhopal, MP"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 502
+    assert "GOOGLE_MAPS_API_KEY" in resp.json()["detail"]

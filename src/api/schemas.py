@@ -57,3 +57,30 @@ class ForecastResponse(BaseModel):
 class HealthResponse(BaseModel):
     status: str
     audit_log_intact: bool
+
+
+class RouteWaypointResponse(BaseModel):
+    lat: float
+    lon: float
+    distance_from_start_km: float
+    value: float
+    p10: float
+    p90: float
+    signature_verified: bool
+
+
+class RouteWeatherResponse(BaseModel):
+    origin: str
+    destination: str
+    distance_km: float
+    duration_min: float
+    variable: str
+    model_version: str
+    path: List[List[float]]  # [[lat, lon], ...] dense polyline for map rendering
+    steps_summary: List[str]
+    waypoints: List[RouteWaypointResponse]
+
+
+class MapsConfigResponse(BaseModel):
+    browser_key: str
+    configured: bool

@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Weather-Aware Route Navigation</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { height: 100%; margin: 0; font-family: -apple-system, Segoe UI, Roboto, sans-serif; background:#0b1020; color:#e6e9f2; }
+  #layout { display:flex; height:100%; }
+  #sidebar { width: 360px; flex-shrink:0; padding: 1.25rem; box-sizing:border-box; background:#131a2e; border-right:1px solid #232c4a; overflow-y:auto; }
+  #mapWrap { flex:1; position:relative; }
+  #map { width:100%; height:100%; }
+  h1 { font-size: 1.05rem; font-weight:600; margin: 0 0 0.25rem; }
+  .sub { color:#8b93b0; font-size:0.8rem; margin-bottom:1.25rem; }
+  label { display:block; font-size:0.78rem; color:#9aa3c2; margin-top:0.75rem; }
+  input, select { width:100%; box-sizing:border-box; margin-top:0.25rem; padding:0.5rem; border-radius:8px; border:1px solid #2a3356; background:#0e1428; color:#e6e9f2; }
+  button { margin-top:1.1rem; width:100%; padding:0.6rem; border-radius:8px; border:none; background:#4f7cff; color:white; font-weight:600; cursor:pointer; }
+  button:disabled { opacity:0.5; cursor:default; }
+  #status { margin-top:0.9rem; font-size:0.8rem; color:#9aa3c2; white-space:pre-wrap; }
+  .summary { margin-top:1rem; background:#0e1428; border:1px solid #232c4a; border-radius:8px; padding:0.7rem 0.9rem; font-size:0.82rem; }
+  .summary div { margin: 0.15rem 0; }
+  #waypointList { margin-top:1rem; }
+  .wp { background:#0e1428; border:1px solid #232c4a; border-radius:8px; padding:0.5rem 0.7rem; margin-bottom:0.5rem; font-size:0.78rem; display:flex; justify-content:space-between; }
+  .wp .val { font-weight:700; }
+  .steps { margin-top:1rem; font-size:0.75rem; color:#9aa3c2; max-height:150px; overflow-y:auto; }
+  .steps div { margin-bottom:0.35rem; }
+  a.back { color:#7c9bff; font-size:0.78rem; text-decoration:none; }
+</style>
+</head>
+<body>
+<div id="layout">
+  <div id="sidebar">
+    <a class="back" href="/">&larr; Forecast demo</a>
+    <h1 style="margin-top:0.75rem;">Weather-Aware Route Navigation</h1>
+    <div class="sub">Real Google navigation, weather sampled along the route by the pipeline.</div>
+
+    <label>Origin</label>
+    <input id="origin" value="Indore, Madhya Pradesh" />
+
+    <label>Destination</label>
+    <input id="destination" value="Bhopal, Madhya Pradesh" />
+
+    <label>Weather variable</label>
+    <select id="variable">
+      <option value="t2m">t2m — temperature (K)</option>
+      <option value="tp">tp — precipitation (mm/hr)</option>
+      <option value="u10">u10 — u-wind (m/s)</option>
+      <option value="v10">v10 — v-wind (m/s)</option>
+    </select>
+
+    <label>Weather sample points along route</label>
+    <input id="numWaypoints" type="number" value="6" min="2" max="10" />
+
+    <button id="goBtn" onclick="planRoute()">Get route + weather</button>
+    <div id="status"></div>
+
+    <div id="summary" class="summary" style="display:none;"></div>
+    <div id="waypointList"></div>
+    <div id="stepsBox" class="steps"></div>
+  </div>
+  <div id="mapWrap"><div id="map"></div></div>
+</div>
+
+<script>
+let map, directionsRenderer, weatherMarkers = [], token = null;
+
+async function ensureToken() {
+  if (token) return token;
+  const resp = await fetch('/v1/auth/token', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({sub: 'route-demo-user', tenant: 'demo', scopes: ['forecast:read']})
+  });
+  if (!resp.ok) throw new Error('Token issuance failed: ' + resp.status);
+  return (await resp.json()).access_token;
+}
+
+function clearWeatherMarkers() {
+  weatherMarkers.forEach(m => m.setMap(null));
+  weatherMarkers = [];
+}
+
+function colorForValue(value, variable) {
+  // Rough, illustrative color banding per variable — not a calibrated scale.
+  if (variable === 'tp') {
+    if (value > 15) return '#e14b4b';
+    if (value > 5) return '#e1a94b';
+    return '#4b8fe1';
+  }
+  if (variable === 't2m') {
+    if (value > 303) return '#e14b4b';   // ~30C+
+    if (value > 288) return '#e1c74b';   // ~15-30C
+    return '#4b8fe1';
+  }
+  return '#7c9bff';
+}
+
+function unitFor(variable) {
+  return {t2m: 'K', tp: 'mm/hr', u10: 'm/s', v10: 'm/s'}[variable] || '';
+}
+
+async function planRoute() {
+  const btn = document.getElementById('goBtn');
+  const status = document.getElementById('status');
+  const origin = document.getElementById('origin').value.trim();
+  const destination = document.getElementById('destination').value.trim();
+  const variable = document.getElementById('variable').value;
+  const numWaypoints = document.getElementById('numWaypoints').value;
+
+  if (!origin || !destination) { status.textContent = 'Origin and destination are required.'; return; }
+
+  btn.disabled = true;
+  status.textContent = 'Authenticating...';
+  document.getElementById('summary').style.display = 'none';
+  document.getElementById('waypointList').innerHTML = '';
+  document.getElementById('stepsBox').innerHTML = '';
+  clearWeatherMarkers();
+  if (directionsRenderer) directionsRenderer.setDirections({routes: []});
+
+  try {
+    const tok = await ensureToken();
+    token = tok;
+
+    // 1. Real Google navigation, rendered client-side.
+    status.textContent = 'Requesting route from Google Directions...';
+    const directionsService = new google.maps.DirectionsService();
+    const dirResult = await new Promise((resolve, reject) => {
+      directionsService.route(
+        { origin, destination, travelMode: google.maps.TravelMode.DRIVING },
+        (result, statusCode) => statusCode === 'OK' ? resolve(result) : reject(new Error('Directions failed: ' + statusCode))
+      );
+    });
+    directionsRenderer.setDirections(dirResult);
+
+    // 2. Weather along the (server-computed) route from our pipeline.
+    status.textContent = 'Running weather pipeline along the route...';
+    const url = `/v1/route-weather?origin=${encodeURIComponent(origin)}&destination=${encodeURIComponent(destination)}` +
+                `&variable=${variable}&num_waypoints=${numWaypoints}`;
+    const resp = await fetch(url, { headers: { 'Authorization': `Bearer ${tok}` } });
+    if (!resp.ok) {
+      const body = await resp.json().catch(() => ({}));
+      throw new Error(body.detail || `Route weather request failed (${resp.status})`);
+    }
+    const data = await resp.json();
+
+    // Summary panel.
+    const summary = document.getElementById('summary');
+    summary.style.display = 'block';
+    summary.innerHTML = `
+      <div><b>${data.distance_km.toFixed(1)} km</b> &middot; ${Math.round(data.duration_min)} min drive</div>
+      <div>Model: ${data.model_version}</div>
+    `;
+
+    // Weather markers along the route.
+    const bounds = new google.maps.LatLngBounds();
+    data.waypoints.forEach((w, i) => {
+      const pos = { lat: w.lat, lng: w.lon };
+      bounds.extend(pos);
+      const marker = new google.maps.Marker({
+        position: pos,
+        map,
+        label: { text: String(i + 1), color: 'white', fontSize: '11px', fontWeight: '700' },
+        icon: {
+          path: google.maps.SymbolPath.CIRCLE,
+          fillColor: colorForValue(w.value, variable),
+          fillOpacity: 0.95,
+          strokeColor: '#0b1020',
+          strokeWeight: 2,
+          scale: 12,
+        },
+        title: `${w.value.toFixed(1)} ${unitFor(variable)} at ${w.distance_from_start_km.toFixed(0)} km`,
+      });
+      weatherMarkers.push(marker);
+    });
+
+    // Waypoint list in the sidebar.
+    const list = document.getElementById('waypointList');
+    data.waypoints.forEach((w, i) => {
+      const row = document.createElement('div');
+      row.className = 'wp';
+      row.innerHTML = `<span>#${i + 1} &middot; ${w.distance_from_start_km.toFixed(0)} km</span>` +
+                       `<span class="val">${w.value.toFixed(1)} ${unitFor(variable)}</span>`;
+      list.appendChild(row);
+    });
+
+    // Turn-by-turn steps.
+    const stepsBox = document.getElementById('stepsBox');
+    data.steps_summary.slice(0, 15).forEach(s => {
+      const d = document.createElement('div');
+      d.textContent = '• ' + s;
+      stepsBox.appendChild(d);
+    });
+
+    status.textContent = `Signature verified on all waypoints: ${data.waypoints.every(w => w.signature_verified)}`;
+  } catch (err) {
+    status.textContent = 'Error: ' + err.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function initMap() {
+  map = new google.maps.Map(document.getElementById('map'), {
+    center: { lat: 22.9734, lng: 78.6569 }, // Madhya Pradesh, India — roughly the demo region
+    zoom: 6,
+    styles: [{ elementType: 'geometry', stylers: [{ color: '#131a2e' }] },
+             { elementType: 'labels.text.stroke', stylers: [{ color: '#0b1020' }] },
+             { elementType: 'labels.text.fill', stylers: [{ color: '#8b93b0' }] }],
+  });
+  directionsRenderer = new google.maps.DirectionsRenderer({ map, suppressMarkers: false });
+}
+
+async function bootstrap() {
+  const status = document.getElementById('status');
+  try {
+    const resp = await fetch('/v1/config/maps-key');
+    const cfg = await resp.json();
+    if (!cfg.configured) {
+      status.textContent = 'GOOGLE_MAPS_API_KEY is not set on the server — set it in .env and restart. See README.';
+      document.getElementById('goBtn').disabled = true;
+      return;
+    }
+    const script = document.createElement('script');
+    script.src = `https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(cfg.browser_key)}&callback=initMap`;
+    script.async = true;
+    document.head.appendChild(script);
+  } catch (err) {
+    status.textContent = 'Failed to load map config: ' + err.message;
+  }
+}
+
+window.initMap = initMap;
+bootstrap();
+</script>
+</body>
+</html>

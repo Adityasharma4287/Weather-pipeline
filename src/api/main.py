@@ -33,12 +33,18 @@ from src.api.schemas import (
     EnsembleSummary,
     ForecastResponse,
     HealthResponse,
+    MapsConfigResponse,
+    RouteWaypointResponse,
+    RouteWeatherResponse,
     TokenRequest,
     TokenResponse,
     VerificationSummary,
 )
 from src.pipeline.orchestrator import WeatherPipelineOrchestrator
+from src.routing.google_directions import DirectionsRequestError
+from src.routing.route_weather_service import RouteWeatherService
 from src.security.audit_log import AuditIntegrityError, AuditLog
+from src.security.secrets_manager import get_default_secrets_manager, SecretNotFoundError
 
 app = FastAPI(
     title="Localized Weather Intelligence API",
@@ -48,6 +54,7 @@ app = FastAPI(
 )
 
 _orchestrator = WeatherPipelineOrchestrator()
+_route_weather_service = RouteWeatherService(orchestrator=_orchestrator)
 _audit = AuditLog()
 
 _STATIC_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "static")
@@ -145,6 +152,73 @@ def get_forecast(
     _audit.record(actor=claims.sub, action="forecast_read", resource=region_id,
                    metadata={"variable": variable, "lead_hours": lead_hours})
     return response
+
+
+@app.get("/v1/route-weather", response_model=RouteWeatherResponse, tags=["routing"])
+def get_route_weather(
+    origin: str = Query(..., description="Address or 'lat,lon' string, e.g. 'Indore, MP' or '22.72,75.86'"),
+    destination: str = Query(..., description="Address or 'lat,lon' string"),
+    variable: str = Query("t2m", description="t2m, u10, v10, or tp"),
+    lead_hours: int = Query(24, ge=6, le=240),
+    num_waypoints: int = Query(6, ge=2, le=10, description="How many points along the route to sample weather at"),
+    claims=Depends(require_auth),
+):
+    """
+    Real turn-by-turn navigation (Google Directions API) with weather from
+    the pipeline sampled at points along the route.
+    """
+    require_scope(claims, "forecast:read")
+
+    try:
+        report = _route_weather_service.get_route_with_weather(
+            origin=origin, destination=destination, variable=variable,
+            lead_hours=lead_hours, num_waypoints=num_waypoints, requested_by=claims.sub,
+        )
+    except DirectionsRequestError as exc:
+        _audit.record(actor=claims.sub, action="route_weather_error", resource=f"{origin}->{destination}",
+                       metadata={"error": str(exc)})
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc))
+    except Exception as exc:  # noqa: BLE001
+        _audit.record(actor=claims.sub, action="route_weather_error", resource=f"{origin}->{destination}",
+                       metadata={"error": str(exc)})
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Route weather generation failed")
+
+    _audit.record(actor=claims.sub, action="route_weather_read", resource=f"{origin}->{destination}",
+                   metadata={"variable": variable, "lead_hours": lead_hours, "num_waypoints": num_waypoints})
+
+    return RouteWeatherResponse(
+        origin=report.origin,
+        destination=report.destination,
+        distance_km=report.distance_km,
+        duration_min=report.duration_min,
+        variable=variable,
+        model_version=report.model_version,
+        path=[[lat, lon] for lat, lon in report.path],
+        steps_summary=report.steps_summary,
+        waypoints=[
+            RouteWaypointResponse(
+                lat=w.lat, lon=w.lon, distance_from_start_km=w.distance_from_start_km,
+                value=w.value, p10=w.p10, p90=w.p90, signature_verified=w.signature_verified,
+            ) for w in report.waypoints
+        ],
+    )
+
+
+@app.get("/v1/config/maps-key", response_model=MapsConfigResponse, tags=["routing"])
+def get_maps_browser_key():
+    """
+    Returns the browser-side Google Maps key so the frontend can render the
+    map without the key being baked into static JS. This key is meant to be
+    restricted by HTTP referrer in Google Cloud Console — it is not a
+    server secret in the same sense as the Directions API credential.
+    """
+    try:
+        key = get_default_secrets_manager().get_secret(
+            "secretsmanager://routing/google-maps-api-key", requested_by="maps-config-endpoint"
+        )
+    except SecretNotFoundError:
+        key = ""
+    return MapsConfigResponse(browser_key=key, configured=bool(key))
 
 
 @app.get("/v1/health", response_model=HealthResponse, tags=["ops"])

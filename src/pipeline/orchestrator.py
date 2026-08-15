@@ -147,6 +147,56 @@ class WeatherPipelineOrchestrator:
         noise_scale = {"tp": 1.0, "t2m": 0.8, "u10": 1.0, "v10": 1.0}.get(variable, 0.8)
         return (ensemble.mean_field + rng.normal(scale=noise_scale, size=ensemble.mean_field.shape)).astype(np.float32)
 
+    def run_for_coordinates(self, lat: float, lon: float, variable: str, lead_hours: int,
+                             init_time: Optional[datetime] = None, requested_by: str = "unknown",
+                             bbox_half_width_deg: float = 0.5, run_verification: bool = False) -> PipelineResult:
+        """
+        Run the pipeline for a specific (lat, lon) point rather than a named
+        region. Used by the route-weather feature: each sampled waypoint
+        along a navigation route gets its own small bounding box so the
+        ingestion stage (Stage A) generates location-specific fields
+        instead of reusing one field for the whole route.
+
+        `region_id` is derived deterministically from the rounded
+        coordinates so repeated queries for (approximately) the same point
+        hit the same simulated terrain/covariates.
+        """
+        region_id = f"route-pt-{lat:.3f}-{lon:.3f}"
+        bbox = (lat - bbox_half_width_deg, lat + bbox_half_width_deg,
+                lon - bbox_half_width_deg, lon + bbox_half_width_deg)
+
+        init_time = init_time or datetime(2026, 1, 1)
+        global_result = self._global_model.run(
+            variable=variable, init_time=init_time, lead_hours=lead_hours,
+            grid_shape=self._region_grid_shape, region_bbox=bbox, requested_by=requested_by,
+        )
+        signed_summary = self._global_model.sign_result(global_result)
+        try:
+            self._signer.verify(signed_summary)
+            signature_verified = True
+        except SignatureVerificationError:
+            signature_verified = False
+
+        covariates = self._get_covariates(region_id)
+        profile = DownscalingProfile(region=region_id, ensemble_members=6, sampler_steps=6)
+        downscaler = CorrDiffDownscaler(profile, audit=self._audit)
+        ensemble = downscaler.downscale(
+            coarse_field=global_result.field.values, covariates=covariates,
+            variable=variable, lead_hours=lead_hours, requested_by=requested_by,
+        )
+
+        result = PipelineResult(
+            region_id=region_id, variable=variable, lead_hours=lead_hours,
+            model_version=global_result.model_version, ensemble=ensemble,
+            signature_verified=signature_verified,
+        )
+        if run_verification:
+            pseudo_truth = self._pseudo_truth(ensemble, variable)
+            result.rmse_vs_pseudo_truth = rmse(ensemble.mean_field, pseudo_truth)
+            result.crps_vs_pseudo_truth = crps_ensemble(ensemble.members, pseudo_truth)
+            result.spread_skill = spread_skill_ratio(ensemble.members, pseudo_truth)
+        return result
+
     def bias_correction_pipeline_for(self, ensemble: DownscaledEnsemble, variable: str) -> BiasCorrectionPipeline:
         """
         Fit a bias-correction pipeline using the pseudo-truth as the

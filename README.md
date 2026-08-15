@@ -26,6 +26,8 @@ GPU machine with network access.
 | Bias correction: quantile mapping + learned residual correction | **Real**, closed-form implementation — `src/verification/bias_correction.py` |
 | API: JWT auth, scopes, rate limiting, caching, audit logging | **Real** (`src/api/main.py`, `src/api/auth.py`) |
 | API: token *issuance* | Dev-only stand-in for a real IdP (Keycloak/Cognito) — see SWAP_POINT in `src/api/auth.py` |
+| Routing: Google Directions API (real route, distance, duration, turn-by-turn) | **Real** — uses your own `GOOGLE_MAPS_API_KEY` |
+| Routing: weather at each route waypoint | Uses the same simulated pipeline as everywhere else in this table — real structure, simulated weights, now seeded per-coordinate so different points on a route get different fields |
 
 Every simulated data path is seeded and deterministic (same inputs -> same
 outputs), so the pipeline is reproducible and fully testable end-to-end.
@@ -59,8 +61,12 @@ weather-pipeline/
 │   ├── verification/
 │   │   ├── metrics.py              # Stage D: RMSE/ACC/CRPS/rank histogram/CSI
 │   │   └── bias_correction.py      # Stage D: quantile mapping + residual correction
+│   ├── routing/
+│   │   ├── google_directions.py    # real Google Directions API client
+│   │   ├── polyline_utils.py       # polyline decode + even waypoint sampling
+│   │   └── route_weather_service.py# ties navigation + pipeline together
 │   ├── pipeline/
-│   │   └── orchestrator.py         # wires Stages A -> D together
+│   │   └── orchestrator.py         # wires Stages A -> D together (region- and coordinate-based)
 │   └── api/
 │       ├── auth.py                 # Stage E: JWT auth + rate limiting
 │       ├── schemas.py              # Stage E: request/response models
@@ -151,6 +157,61 @@ curl http://127.0.0.1:8000/v1/health
 
 Unauthenticated requests get `401`; tokens missing the `forecast:read`
 scope get `403`; repeated identical requests are served from cache.
+
+## Map navigation + weather along the route (Google Maps)
+
+A new feature: real Google Maps turn-by-turn navigation, with the pipeline's
+weather sampled at points along the route — "map pe route + us route ke
+weather conditions".
+
+**Setup (one-time):**
+1. In [Google Cloud Console](https://console.cloud.google.com/), enable the
+   **Directions API** and **Maps JavaScript API** for your project, and
+   create an API key.
+2. Add it to your `.env`:
+   ```
+   GOOGLE_MAPS_API_KEY=your-real-key-here
+   ```
+   (Local dev without Docker: `export GOOGLE_MAPS_API_KEY=your-real-key-here`
+   before running `uvicorn`.)
+3. For production, restrict the key: HTTP-referrer restriction if you use
+   the same key client-side (this app serves it to the browser via
+   `/v1/config/maps-key` for map rendering), and/or use a second,
+   server-IP-restricted key for the backend's own Directions API calls.
+
+**Use it:** start the server, open `http://127.0.0.1:8000/static/route.html`
+(also linked from the main `/` demo page). Enter an origin and destination,
+pick a weather variable, click **Get route + weather**. You get:
+- The real Google-rendered route and turn-by-turn directions.
+- Numbered markers along the route, colored by the pipeline's forecast
+  value at that point, with a distance-from-start readout.
+- Signature-verification status confirming every waypoint's forecast went
+  through the same signed-artifact integrity check as the rest of the
+  pipeline.
+
+**How it works under the hood** (`src/routing/`):
+- `google_directions.py` — real client for the Directions API (network
+  call + response parsing kept separate so the parsing logic is
+  unit-testable without hitting Google).
+- `polyline_utils.py` — decodes Google's encoded polyline and samples
+  evenly-spaced waypoints along it by cumulative distance (not just by
+  index, so a curvy vs. straight stretch of road still gets fair sampling).
+- `route_weather_service.py` — for each sampled waypoint, calls
+  `WeatherPipelineOrchestrator.run_for_coordinates(lat, lon, ...)`, which
+  runs the *same* Stage A→D pipeline as the region-based forecast endpoint,
+  just keyed on coordinates instead of a named region — so each point on
+  the route gets its own location-aware simulated forecast (Stage A's
+  simulated ingestion is seeded on the bounding box, not just the variable,
+  specifically so different points along a route don't all get the same
+  field).
+
+New endpoints:
+- `GET /v1/route-weather?origin=...&destination=...&variable=t2m&num_waypoints=6`
+  — auth required (`forecast:read` scope), same pattern as `/v1/forecast`.
+- `GET /v1/config/maps-key` — public, returns the browser-side Maps key so
+  it isn't hardcoded into the static JS (safe because this key is meant to
+  be referrer-restricted, not secret in the same sense as the Directions
+  API credential).
 
 ## Browser UI (no CLI needed)
 

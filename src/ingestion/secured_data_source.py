@@ -131,7 +131,8 @@ class SecuredDataSource:
         the same request are reproducible (important for tests and for the
         "cache keyed on init_time" behavior used in Stage B).
         """
-        seed = abs(hash((request.source, request.variable, request.init_time.isoformat()))) % (2**32)
+        seed = abs(hash((request.source, request.variable, request.init_time.isoformat(),
+                          request.region_bbox))) % (2**32)
         rng = np.random.default_rng(seed)
         h, w = request.grid_shape
 
